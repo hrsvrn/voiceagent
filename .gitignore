@@ -3,3 +3,5 @@ venv/
 .env
 PROMPTS_FLOW.md
 verify_token_count.py
+.agent/
+.gemini/

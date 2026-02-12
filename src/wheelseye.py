@@ -1,5 +1,7 @@
 from dotenv import load_dotenv
 import os
+import asyncio
+import time
 from pathlib import Path
 
 import logging
@@ -9,7 +11,13 @@ from livekit.agents.llm import function_tool
 from livekit.agents.metrics import LLMMetrics, EOUMetrics, TTSMetrics
 from livekit.plugins import silero, deepgram, cartesia, openai
 from pricing import PricingManager, validate_payload, PLAN_KEYS
+from silence_handler import SilenceHandler
+from intent_router import IntentRouter
 import prompts
+
+# LiveKit Server API for room management (delete room → SIP BYE)
+import livekit.api as lkapi
+from livekit.api import DeleteRoomRequest
 
 logger = logging.getLogger("voice_agent")
 logger.setLevel(logging.INFO)
@@ -98,12 +106,15 @@ class WheelsEyeSupportAgent(Agent):
         # Store rec_key for tool use
         self._rec_plan_key = rec_key
 
+        # ── Phase tracking ────────────────────────────────────────
+        self._current_phase = "greeting"
+
         # Start with GREETING phase
         self._instructions = prompts.get_phase_prompt("greeting", self.prompt_context)
 
         super().__init__(
             instructions=self._instructions,
-            min_endpointing_delay=0.150,
+            min_endpointing_delay=0.25,  # ↑ from 0.15 — Hindi speakers pause mid-sentence
         )
 
     @property
@@ -114,18 +125,26 @@ class WheelsEyeSupportAgent(Agent):
     def instructions(self, value):
         self._instructions = value
 
+    @property
+    def current_phase(self) -> str:
+        """Returns the current conversation phase."""
+        return self._current_phase
+
     @function_tool
     async def transition_to_phase(self, context: RunContext, phase: str):
         """
         Transitions the conversation to the specified phase by updating the agent's instructions.
-        Valid phases: 'pitch', 'objections', 'payment', 'greeting'.
+        Valid phases: 'greeting', 'pitch', 'objections', 'downsell', 'payment', 'confirm'.
+        Sales funnel: greeting → pitch → objections/downsell → payment → confirm.
         """
         logger.info(f"Transitioning to phase: {phase}")
 
-        if phase not in ["greeting", "pitch", "objections", "payment"]:
+        valid_phases = ["greeting", "pitch", "objections", "downsell", "payment", "confirm"]
+        if phase not in valid_phases:
             logger.warning(f"Invalid phase requested: {phase}")
-            return "Invalid phase."
+            return f"Invalid phase. Valid phases: {', '.join(valid_phases)}"
 
+        self._current_phase = phase
         new_instructions = prompts.get_phase_prompt(phase, self.prompt_context)
         self.instructions = new_instructions
 
@@ -176,19 +195,29 @@ class WheelsEyeSupportAgent(Agent):
                     available_count += 1
 
         if available_count == 0:
-            all_plans_text = "क्षमा करें, अभी कोई प्लान उपलब्ध नहीं है."
+            all_plans_text = "अभी कोई plan available नहीं है."
         else:
-            all_plans_text += "आप कौन सा प्लान लेना चाहेंगे?"
+            all_plans_text += "\nआपके लिए मैं " + self.prompt_context.get('recommended_plan', '') + " सबसे अच्छा मानती हूँ. लगा दूँ?"
 
         return all_plans_text
 
 
+# ─── Graceful Disconnect Configuration ────────────────────────────────────────
+GOODBYE_WAIT_SECONDS = 4  # Wait for TTS to finish saying goodbye before teardown
+
+
 async def entrypoint(ctx: agents.JobContext):
-    vad = silero.VAD.load(min_speech_duration=0.25)
+    # ── VAD: Tuned for noisy truck environments ──────────────────
+    vad = silero.VAD.load(
+        min_speech_duration=0.3,     # ↑ from 0.25 — requires 300ms of speech to trigger
+        min_silence_duration=0.4,    # 400ms silence = end of utterance
+    )
+
     session = AgentSession(
         stt=deepgram.STT(
             model="nova-3",
             language="hi",
+            smart_format=True,       # Better formatting of numbers/entities
         ),
         llm=openai.LLM(
             model="gpt-4o-mini",
@@ -200,15 +229,127 @@ async def entrypoint(ctx: agents.JobContext):
             language="hi",
         ),
         vad=vad,
-        min_interruption_duration=0.5,
-        min_endpointing_delay=0.150,
-        min_interruption_words=2,
-        preemptive_generation=True,
+        # ── Retuned for Hindi conversational speech ───────────────
+        min_interruption_duration=0.6,    # ↑ from 0.5 — prevents "hmm" from interrupting
+        min_endpointing_delay=0.25,       # ↑ from 0.15 — Hindi speakers pause mid-sentence
+        min_interruption_words=3,         # ↑ from 2 — requires 3 words to trigger interruption
+        preemptive_generation=True,       # Start LLM while TTS still playing
     )
+
+    # ── Initialize agent with payload ─────────────────────────────
+    agent = WheelsEyeSupportAgent(payload=SAMPLE_PAYLOAD)
+    call_state = {"user_spoken": False}
+
+    # ── Intent Router (regex-based, zero-cost classification) ─────
+    intent_router = IntentRouter()
+
+    # ── Session-ended flag (prevents double-disconnect) ───────────
+    session_ended = False
+
+    # ── Graceful Disconnect Function ──────────────────────────────
+    #
+    # This is the SINGLE function for ALL disconnect scenarios:
+    #   - User idle timeout (auto-disconnect)
+    #   - User hangs up (detected via room events)
+    #   - Conversation ends naturally
+    #
+    # Steps:
+    #   1. Say goodbye (if message provided and session still active)
+    #   2. Shutdown the agent session (drains pending speech)
+    #   3. Delete the LiveKit room → sends SIP BYE to trunk provider
+    #
+    # WHY delete_room is critical:
+    #   - session.shutdown() only disconnects the AGENT
+    #   - The SIP caller stays connected (hearing silence) unless the room is deleted
+    #   - Deleting the room triggers LiveKit to send SIP BYE to the trunk
+    #
+
+    async def graceful_disconnect(goodbye_msg: str = None):
+        """
+        Gracefully disconnect the call with proper SIP trunk teardown.
+
+        Args:
+            goodbye_msg: Optional farewell message to speak before disconnecting.
+                        Pass None to skip the goodbye (e.g., when user already hung up).
+        """
+        nonlocal session_ended
+
+        if session_ended:
+            logger.info("Session already ended. Ignoring duplicate disconnect request.")
+            return
+
+        session_ended = True
+
+        # Stop silence monitoring immediately
+        silence_handler.shutdown()
+
+        try:
+            # Step 1: Say goodbye (optional — skip if user already hung up)
+            if goodbye_msg:
+                try:
+                    # OPTIMIZATION: Use session.say() to bypass LLM token usage for goodbye
+                    await session.say(goodbye_msg, add_to_chat_ctx=True)
+                    # Wait for TTS to finish playing the goodbye
+                    await asyncio.sleep(GOODBYE_WAIT_SECONDS)
+                except Exception as e:
+                    logger.warning(f"Failed to say goodbye: {e}")
+
+            # Step 2: Shutdown agent session (graceful drain of pending speech)
+            try:
+                # Note: If logging shows 'NoneType can't be used in await', session.shutdown() 
+                # might be synchronous or already completed. We'll try to await it, 
+                # but handle TypeError just in case.
+                val = session.shutdown()
+                if val is not None and hasattr(val, '__await__'):
+                    await val
+                logger.info("Agent session shut down successfully.")
+            except Exception as e:
+                logger.warning(f"Error shutting down session: {e}")
+
+            # Step 3: Delete the room → sends SIP BYE signal to trunk provider
+            #
+            # This is the most important step. Without this, the phone call
+            # stays connected even after the agent disconnects.
+            try:
+                lk_api = lkapi.LiveKitAPI()  # Uses LIVEKIT_URL, API_KEY, API_SECRET from env
+                try:
+                    await lk_api.room.delete_room(
+                        DeleteRoomRequest(room=ctx.room.name)
+                    )
+                    logger.info(f"Room '{ctx.room.name}' deleted. SIP trunk disconnected via BYE.")
+                except Exception as e:
+                    # If 404/Not Found, the room is already gone. That's a success.
+                    if "not found" in str(e).lower() or "404" in str(e):
+                        logger.info(f"Room '{ctx.room.name}' already deleted.")
+                    else:
+                        raise e
+                finally:
+                    await lk_api.aclose()
+                    
+            except Exception as e:
+                logger.error(f"Failed to delete room for SIP teardown: {e}")
+
+        except Exception as e:
+            logger.error(f"Error during graceful disconnect: {e}")
+
+    # ── Silence Handler (re-prompt + auto-disconnect) ─────────────
+    silence_handler = SilenceHandler(
+        session=session,
+        get_current_phase=lambda: agent.current_phase,
+        disconnect_callback=graceful_disconnect,
+    )
+
+    # ── Event Handlers ────────────────────────────────────────────
 
     @session.on("agent_state_changed")
     def on_state_changed(state):
         logger.info(f"Agent State: {state}")
+        # Silence detection: start monitoring when agent finishes speaking
+        # Note: state is an AgentStateChanged object, not a string
+        if state.new_state == "listening":
+            silence_handler.on_agent_done_speaking()
+        elif state.new_state == "speaking":
+            silence_handler.on_agent_started_speaking()
 
     @session.on("error")
     def on_session_error(err):
@@ -226,7 +367,25 @@ async def entrypoint(ctx: agents.JobContext):
 
     @session.on("user_input_transcribed")
     def on_user_input(event):
-        logger.info(f"on_user_input: {event.transcript}")
+        transcript = event.transcript
+        logger.info(f"on_user_input: {transcript}")
+        # Mark that user has spoken (cancels initial timeout)
+        call_state["user_spoken"] = True
+
+        # Intent routing: skip LLM for noise/backchannels
+        intent = intent_router.classify(transcript)
+        if intent == "noise":
+            logger.info(f"Filtered noise transcript: '{transcript}'")
+            return
+
+        # Valid speech (or backchannel) detected — reset silence timer
+        silence_handler.on_user_spoke()
+
+        if intent == "backchannel":
+            logger.info(f"Backchannel detected: '{transcript}' — not interrupting agent")
+            return
+        if intent:
+            logger.info(f"Fast intent detected: {intent} — '{transcript}'")
 
     @session.on("metrics_collected")
     def on_metrics_collected(event: MetricsCollectedEvent):
@@ -261,19 +420,74 @@ async def entrypoint(ctx: agents.JobContext):
                     )
                     del latency_tracker[metrics.speech_id]
 
-    # Initialize agent with payload
-    agent = WheelsEyeSupportAgent(payload=SAMPLE_PAYLOAD)
+    # ── Room-Level Event Handlers (SIP disconnect detection) ──────
+    #
+    # These handlers detect when the USER hangs up the phone call.
+    # Without these, the agent session stays alive indefinitely
+    # after the user disconnects.
 
+    @ctx.room.on("participant_disconnected")
+    def on_participant_left(participant):
+        """Detect when any participant (including SIP caller) leaves the room."""
+        logger.info(
+            f"Participant disconnected: identity={participant.identity}, "
+            f"kind={participant.kind}"
+        )
+
+        # Only trigger cleanup for non-agent participants
+        # (the agent itself disconnecting shouldn't trigger this)
+        if participant.kind != participant.kind.AGENT:
+            logger.info("Non-agent participant left. Initiating agent-side cleanup.")
+            asyncio.create_task(
+                graceful_disconnect(goodbye_msg=None)
+            )
+
+    @ctx.room.on("reconnecting")
+    def on_reconnecting():
+        logger.warning("Room reconnecting — preserving agent state")
+        silence_handler.on_user_spoke()  # Pause silence timer during reconnect
+
+    @ctx.room.on("reconnected")
+    def on_reconnected():
+        logger.info("Room reconnected — resuming conversation")
+        asyncio.create_task(session.generate_reply(
+            instructions="कनेक्शन वापस आ गया—हम कहाँ रुके थे? चलिए आगे बढ़ते हैं."
+        ))
+
+    @ctx.room.on("disconnected")
+    def on_disconnected():
+        logger.error("Room disconnected — call ended")
+        silence_handler.shutdown()
+
+    # ── Start Session ─────────────────────────────────────────────
     await session.start(
         room=ctx.room,
         agent=agent,
     )
 
-    # First message: short greeting that waits for user's hello
+    # ── Initial Interaction Logic ─────────────────────────────────
+    # Wait for the user to say "Hello" first (standard phone etiquette).
+    # If they are silent for 4s, we initiate the conversation.
+    
     first_name = agent.validated["first_name"]
-    await session.generate_reply(
-        instructions=f"नमस्ते {first_name} जी, मैं वंशिका वीलसाई जीपीएस से बोल रही हूँ. क्या अभी बात हो सकती है?"
-    )
+    vehicle_hindi = agent.validated["vehicle_last4_hindi"]
+    opening_text = f"<warm> नमस्ते {first_name} जी! मैं वंशिका, Wheelseye GPS टीम से बोल रही हूँ. आपकी गाड़ी {vehicle_hindi} के GPS ट्रैकिंग को लेकर एक ज़रूरी जानकारी देनी थी."
+    
+    INITIAL_SILENCE_SECONDS = 4.0
+
+    async def initial_silence_check():
+        await asyncio.sleep(INITIAL_SILENCE_SECONDS)
+        # If user hasn't spoken yet, we break the silence
+        if not call_state["user_spoken"]:
+            logger.info(f"User silent for {INITIAL_SILENCE_SECONDS}s. Initiating call.")
+            # OPTIMIZATION: Use session.say() instead of generate_reply()
+            # This saves tokens and ensures the exact text/tags are spoken.
+            await session.say(opening_text, add_to_chat_ctx=True)
+            # Mark as spoken to align state
+            call_state["user_spoken"] = True
+
+    # Start the check in background without blocking handling of user input
+    asyncio.create_task(initial_silence_check())
 
 if __name__ == "__main__":
     agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))

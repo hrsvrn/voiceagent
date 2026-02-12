@@ -1,6 +1,7 @@
 # Core LiveKit dependencies
 livekit-agents>=0.8.0
 livekit>=0.11.0
+livekit-api>=0.7.0
 
 # LiveKit plugins for STT, TTS, LLM, and VAD
 livekit-plugins-deepgram
